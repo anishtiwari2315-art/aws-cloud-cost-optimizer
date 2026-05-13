@@ -1,4 +1,4 @@
-# AWS Cloud Cost Optimizer
+# AWS Cloud Cost Optimization
 
 ![GitHub Actions](https://github.com/anishtiwari2315-art/aws-cloud-cost-optimizer/actions/workflows/cost-scan.yml/badge.svg)
 ![Python](https://img.shields.io/badge/Python-3.11-blue?logo=python)
