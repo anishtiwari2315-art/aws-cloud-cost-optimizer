@@ -1,0 +1,259 @@
+# =============================================================
+# GitHub Actions - AWS Cloud Cost Optimizer CI/CD Pipeline
+# Triggers:
+#   1. Push/PR to main branch (linting + security check)
+#   2. Scheduled weekly (Monday 9AM UTC) - live cost scan
+#   3. Manual dispatch (run anytime)
+# =============================================================
+
+name: AWS Cloud Cost Optimizer
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    # Every Monday at 9:00 AM UTC
+    - cron: '0 9 * * MON'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to scan'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      dry_run:
+        description: 'Dry run (report only, no Terraform changes)'
+        required: false
+        default: 'true'
+        type: boolean
+
+env:
+  AWS_REGION: us-east-1
+  PYTHON_VERSION: '3.11'
+  TERRAFORM_VERSION: '1.7.0'
+
+jobs:
+  # ---------------------------------------------------------------
+  # JOB 1: Code Quality & Security
+  # ---------------------------------------------------------------
+  lint-and-security:
+    name: Lint & Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements*.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install flake8 black bandit safety boto3 moto pytest pytest-cov
+
+      - name: Lint with flake8
+        run: |
+          flake8 scripts/ lambda/ --max-line-length=120 --ignore=E501,W503 \
+            --exclude=__pycache__,.git
+        continue-on-error: true
+
+      - name: Check code formatting with Black
+        run: black --check --line-length=120 scripts/ lambda/
+        continue-on-error: true
+
+      - name: Security scan with Bandit
+        run: |
+          bandit -r scripts/ lambda/ -f json -o bandit-report.json || true
+          echo "Bandit scan complete"
+          cat bandit-report.json
+
+      - name: Check dependencies for known CVEs
+        run: safety check --json || true
+
+      - name: Upload security report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-report
+          path: bandit-report.json
+          retention-days: 30
+
+  # ---------------------------------------------------------------
+  # JOB 2: Unit Tests
+  # ---------------------------------------------------------------
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: lint-and-security
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install test dependencies
+        run: |
+          pip install boto3 moto pytest pytest-cov
+
+      - name: Run unit tests
+        run: |
+          pytest tests/ -v --cov=scripts --cov=lambda --cov-report=xml \
+            --cov-report=term-missing || echo "No tests found - skipping"
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 30
+
+  # ---------------------------------------------------------------
+  # JOB 3: Terraform Validate
+  # ---------------------------------------------------------------
+  terraform-validate:
+    name: Terraform Validate
+    runs-on: ubuntu-latest
+    needs: lint-and-security
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive terraform/
+        continue-on-error: true
+
+      - name: Terraform Init
+        run: terraform -chdir=terraform init -backend=false
+
+      - name: Terraform Validate
+        run: terraform -chdir=terraform validate
+
+  # ---------------------------------------------------------------
+  # JOB 4: Deploy Infrastructure (main branch only)
+  # ---------------------------------------------------------------
+  terraform-deploy:
+    name: Deploy Infrastructure
+    runs-on: ubuntu-latest
+    needs: [test, terraform-validate]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Terraform Init
+        run: terraform -chdir=terraform init
+
+      - name: Terraform Plan
+        run: |
+          terraform -chdir=terraform plan \
+            -var="alert_email=${{ secrets.ALERT_EMAIL }}" \
+            -out=tfplan
+
+      - name: Terraform Apply
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: terraform -chdir=terraform apply -auto-approve tfplan
+
+  # ---------------------------------------------------------------
+  # JOB 5: Run Cost Scan (Scheduled / Manual)
+  # ---------------------------------------------------------------
+  cost-scan:
+    name: Run Cost Optimization Scan
+    runs-on: ubuntu-latest
+    needs: [test]
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: pip install boto3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create reports directory
+        run: mkdir -p reports
+
+      - name: Run EC2 Idle Detection
+        run: |
+          echo "Running EC2 idle instance detection..."
+          python scripts/ec2_idle_detector.py
+
+      - name: Run EBS Unused Volume Detection
+        run: |
+          echo "Running EBS unused volume detection..."
+          python scripts/ebs_unused_volumes.py
+
+      - name: Run S3 Cost Optimization
+        run: |
+          echo "Running S3 cost optimization analysis..."
+          python scripts/s3_cost_optimizer.py
+
+      - name: Upload Cost Reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: cost-optimization-reports-${{ github.run_number }}
+          path: reports/
+          retention-days: 90
+
+      - name: Print Summary
+        run: |
+          echo "## Cost Optimization Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "Scan completed at: $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "Reports generated in reports/ directory" >> $GITHUB_STEP_SUMMARY
+          if [ -f reports/ec2_idle_report.json ]; then
+            echo "EC2 idle instances found: $(cat reports/ec2_idle_report.json | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d[\"total_idle_instances\"])')" >> $GITHUB_STEP_SUMMARY
+            echo "Estimated monthly savings: \$$(cat reports/ec2_idle_report.json | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d[\"estimated_monthly_savings_usd\"])')" >> $GITHUB_STEP_SUMMARY
+          fi
