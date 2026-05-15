@@ -154,16 +154,13 @@ jobs:
         run: terraform -chdir=terraform validate
 
   # ---------------------------------------------------------------
-  # JOB 4: Deploy Infrastructure (main branch only, requires AWS secrets)
+  # JOB 4: Deploy Infrastructure (manual trigger only)
   # ---------------------------------------------------------------
   terraform-deploy:
     name: Deploy Infrastructure
     runs-on: ubuntu-latest
     needs: [test, terraform-validate]
-    if: >
-      github.ref == 'refs/heads/main' &&
-      github.event_name != 'pull_request' &&
-      secrets.AWS_ACCESS_KEY_ID != ''
+    if: github.event_name == 'workflow_dispatch'
     environment: production
     steps:
       - name: Checkout code
@@ -252,6 +249,6 @@ jobs:
           echo "Scan completed at: $(date)" >> $GITHUB_STEP_SUMMARY
           echo "Reports generated in reports/ directory" >> $GITHUB_STEP_SUMMARY
           if [ -f reports/ec2_idle_report.json ]; then
-            echo "EC2 idle instances found: $(cat reports/ec2_idle_report.json | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d[\"total_idle_instances\"])')" >> $GITHUB_STEP_SUMMARY
-            echo "Estimated monthly savings: \$$(cat reports/ec2_idle_report.json | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d[\"estimated_monthly_savings_usd\"])')" >> $GITHUB_STEP_SUMMARY
+            echo "EC2 idle instances found: $(cat reports/ec2_idle_report.json | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["total_idle_instances"])')" >> $GITHUB_STEP_SUMMARY
+            echo "Estimated monthly savings: \$$(cat reports/ec2_idle_report.json | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["estimated_monthly_savings_usd"])')" >> $GITHUB_STEP_SUMMARY
           fi
